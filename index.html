@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Sun–Earth–Moon Orrery</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #04060c;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #dfe6f0; }
+  #view { position: fixed; inset: 0; touch-action: none; -webkit-user-select: none; user-select: none; }
+
+  .card { position: fixed; background: rgba(10,14,24,0.78); border: 1px solid rgba(140,170,220,0.18);
+    border-radius: 12px; padding: 10px 12px; font-size: 13px; line-height: 1.45; z-index: 10; }
+
+  #readout { top: max(10px, env(safe-area-inset-top)); left: max(10px, env(safe-area-inset-left)); min-width: 190px; }
+  #readout .big { font-size: 14px; font-weight: 600; color: #fff; letter-spacing: 0.02em; }
+  #readout .dim { color: #9fb0c8; }
+  #roPhase { color: #ffd98a; }
+
+  #controls { left: 50%; transform: translateX(-50%); bottom: max(10px, env(safe-area-inset-bottom));
+    width: min(560px, calc(100% - 16px)); display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  button { background: rgba(70,95,140,0.35); color: #e8eefb; border: 1px solid rgba(140,170,220,0.3);
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; min-height: 38px; cursor: pointer; }
+  button:active { background: rgba(110,145,200,0.55); }
+  button.active { background: rgba(90,140,220,0.65); border-color: rgba(170,200,255,0.7); }
+  input[type="datetime-local"] { background: rgba(20,28,44,0.9); color: #e8eefb; border: 1px solid rgba(140,170,220,0.3);
+    border-radius: 8px; padding: 7px 8px; font-size: 13px; min-height: 38px; flex: 1; min-width: 150px; }
+  input[type="range"] { flex: 1; accent-color: #6ea3ff; min-width: 90px; height: 38px; }
+  .lbl { font-size: 12px; color: #9fb0c8; white-space: nowrap; }
+  #speedLabel { min-width: 72px; font-size: 13px; color: #cfe0ff; }
+  #focusRow button { flex: 1; }
+  #scaleCaption { font-size: 11px; color: #93a5c0; flex: 1; line-height: 1.3; }
+  #err { top: 40%; left: 50%; transform: translate(-50%,-50%); display: none; max-width: 320px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="view"></div>
+
+<div id="readout" class="card">
+  <div id="roDate" class="big">—</div>
+  <div id="roSeason" class="dim">—</div>
+  <div id="roPhase">—</div>
+</div>
+
+<div id="controls" class="card">
+  <div class="row">
+    <span class="lbl">UTC</span>
+    <input type="datetime-local" id="dateInput">
+    <button id="btnNow">Now</button>
+  </div>
+  <div class="row">
+    <span class="lbl">Speed</span>
+    <input type="range" id="speed" min="0" max="6" step="1" value="1">
+    <span id="speedLabel">Real-time</span>
+  </div>
+  <div class="row" id="focusRow">
+    <button data-focus="sun">Sun</button>
+    <button data-focus="earth">Earth</button>
+    <button data-focus="moon">Moon</button>
+    <button data-focus="free" class="active">Free</button>
+  </div>
+  <div class="row">
+    <button id="btnScale">True scale: OFF</button>
+    <span id="scaleCaption"></span>
+  </div>
+</div>
+
+<div id="err" class="card">WebGL is not available in this browser, so the orrery cannot render.</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+'use strict';
+
+/* ============================== CONFIG ================================== */
+
+var DEG = Math.PI / 180;
+var TILT = 23.44 * DEG;            // Earth's axial tilt
+var MOON_INCL = 5.1 * DEG;         // Moon's orbital inclination to the ecliptic
+var YEAR_DAYS = 365.2422;
+var SYNODIC_DAYS = 29.530588853;
+var DAY_MS = 86400000;
+// Epochs (UTC): March equinox 2000-03-20 07:35, new moon 2000-01-06 18:14
+var EQUINOX_MS = Date.UTC(2000, 2, 20, 7, 35);
+var NEW_MOON_MS = Date.UTC(2000, 0, 6, 18, 14);
+// Snow: snowline latitude swings between these per hemisphere; snow lags the
+// solstice by ~30 days (coldest weeks come after midwinter).
+var SNOW_LAT_WINTER = 40 * DEG;
+var SNOW_LAT_SUMMER = 78 * DEG;
+var SNOW_LAG = 2 * Math.PI * (30 / YEAR_DAYS);
+
+// Scales, in Earth radii. "readable" is the compressed default; "true" is real.
+// Interpolated in log space so the animation reads smoothly across magnitudes.
+var SCALES = {
+  readable: { sunR: 4,     earthOrbit: 40,    moonOrbit: 6 },
+  true:     { sunR: 109.2, earthOrbit: 23481, moonOrbit: 60.27 }
+};
+var EARTH_R = 1, MOON_R = 0.273;
+
+var SPEED_STOPS = [0, 1, 60, 3600, 21600, 86400, 604800];
+var SPEED_LABELS = ['Paused', 'Real-time', '1 min/s', '1 hour/s', '6 hours/s', '1 day/s', '1 week/s'];
+
+/* ========================== TIME / ASTRONOMY ============================ */
+
+// Orbital angle from the March equinox. theta=0: equinox (axis perpendicular
+// to the Sun-Earth line). theta=pi/2: June solstice — Earth is placed at
+// (-D,0,0) there, and the axis leans toward +X, so the NORTH pole leans
+// sunward exactly then. This pairing is the load-bearing seasons invariant.
+function orbitAngle(ms) {
+  var t = (ms - EQUINOX_MS) / DAY_MS / YEAR_DAYS;
+  return (t - Math.floor(t)) * 2 * Math.PI;
+}
+function earthPosition(theta, D, out) {
+  // CCW as seen from north (+Y), matching reality.
+  return out.set(-Math.sin(theta) * D, 0, -Math.cos(theta) * D);
+}
+function moonPhase(ms) { // 0 = new, 0.5 = full
+  var t = (ms - NEW_MOON_MS) / DAY_MS / SYNODIC_DAYS;
+  return t - Math.floor(t);
+}
+function utcHours(ms) {
+  var d = ((ms % DAY_MS) + DAY_MS) % DAY_MS;
+  return d / 3600000;
+}
+// Per-hemisphere warmth in [0,1]; peaks ~30 days after that hemisphere's
+// summer solstice. South is the same curve half a year out of phase.
+function warmthNorth(theta) {
+  return 0.5 + 0.5 * Math.cos(theta - Math.PI / 2 - SNOW_LAG);
+}
+function snowlineLat(warmth) {
+  return SNOW_LAT_WINTER + (SNOW_LAT_SUMMER - SNOW_LAT_WINTER) * warmth;
+}
+var SEASONS_N = ['Spring', 'Summer', 'Autumn', 'Winter'];
+var SEASONS_S = ['Autumn', 'Winter', 'Spring', 'Summer'];
+function seasonIndex(theta) {
+  return Math.floor((theta / (2 * Math.PI)) * 4) % 4;
+}
+var PHASE_NAMES = ['New Moon', 'Waxing Crescent', 'First Quarter', 'Waxing Gibbous',
+                   'Full Moon', 'Waning Gibbous', 'Last Quarter', 'Waning Crescent'];
+function phaseName(p) {
+  return PHASE_NAMES[Math.floor(((p + 1 / 16) % 1) * 8)];
+}
+function fmtUTC(ms) {
+  return new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+}
+
+/* ===================== PROCEDURAL TEXTURES (no images) ================== */
+
+function makeRng(seed) {
+  var s = seed >>> 0;
+  return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+}
+function hash2(x, y, seed) {
+  var h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(seed, 2654435761)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+// Value noise, tileable in x with the given period (so textures wrap at the
+// date line without a seam).
+function vnoise(x, y, period, seed) {
+  var xi = Math.floor(x), yi = Math.floor(y);
+  var xf = x - xi, yf = y - yi;
+  var u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  var x0 = ((xi % period) + period) % period, x1 = (x0 + 1) % period;
+  var a = hash2(x0, yi, seed), b = hash2(x1, yi, seed);
+  var c = hash2(x0, yi + 1, seed), d = hash2(x1, yi + 1, seed);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(u01, v01, seed, octaves) {
+  var amp = 0.5, freq = 4, sum = 0, norm = 0;
+  for (var o = 0; o < octaves; o++) {
+    sum += amp * vnoise(u01 * freq, v01 * freq, freq, seed + o * 101);
+    norm += amp; amp *= 0.5; freq *= 2;
+  }
+  return sum / norm;
+}
+
+// Stylized continents: gaussian blobs at roughly real lon/lat positions, with
+// FBM raggedness. [lonCenter, latCenter, lonRadius, latRadius, amplitude]
+var CONTINENTS = [
+  [20, 4, 24, 30, 1.05],    // Africa
+  [24, 52, 32, 12, 0.85],   // Europe
+  [95, 50, 58, 22, 1.05],   // Asia
+  [78, 20, 13, 12, 0.85],   // India
+  [107, 8, 15, 12, 0.7],    // SE Asia
+  [135, -25, 19, 13, 0.95], // Australia
+  [-100, 47, 36, 20, 1.05], // North America
+  [-104, 24, 14, 11, 0.8],  // Mexico / Central America
+  [-60, -14, 16, 26, 1.0],  // South America
+  [-42, 75, 14, 8, 0.85],   // Greenland
+  [0, -90, 999, 14, 1.35]   // Antarctica (all longitudes)
+];
+var LAND_THRESHOLD = 0.48;
+
+function landField(lonDeg, latDeg, ragged) {
+  var f = 0;
+  for (var i = 0; i < CONTINENTS.length; i++) {
+    var b = CONTINENTS[i];
+    var dl = Math.abs(lonDeg - b[0]);
+    if (dl > 180) dl = 360 - dl;
+    var dx = dl / b[2], dy = (latDeg - b[1]) / b[3];
+    f += b[4] * Math.exp(-(dx * dx + dy * dy) * 1.8);
+  }
+  return f + (ragged - 0.5) * 1.05;
+}
+
+// Earth day map, 1024x512 RGBA DataTexture.
+// RGB = surface color. A = snow susceptibility: ~0.06 on ocean (freezes only
+// near the permanent caps), 0.4..1.0 on land (elevation-ish noise) so the
+// snowline in the shader gets a ragged natural edge, not a hard latitude cut.
+// Longitude convention: column u=0.5 is longitude 0 (Greenwich); row 0 is the
+// south pole (DataTexture flipY=false, uv.y=1 at the sphere's north pole).
+function makeEarthTexture() {
+  var W = 1024, H = 512;
+  var data = new Uint8Array(W * H * 4);
+  var GRASS = [0.11, 0.30, 0.09], SAND = [0.62, 0.53, 0.31];
+  var TUNDRA = [0.40, 0.36, 0.28];
+  var SHALLOW = [0.06, 0.31, 0.43], DEEP = [0.013, 0.06, 0.19];
+  for (var j = 0; j < H; j++) {
+    var v = (j + 0.5) / H;
+    var lat = (v - 0.5) * 180;
+    var absLat = Math.abs(lat);
+    for (var i = 0; i < W; i++) {
+      var u = (i + 0.5) / W;
+      var lon = (u - 0.5) * 360;
+      var ragged = fbm(u, v, 10, 6);
+      var field = landField(lon, lat, ragged);
+      var r, g, b, a;
+      if (field > LAND_THRESHOLD) {
+        var elev = fbm(u, v, 500, 4);
+        var patch = fbm(u, v, 900, 3);
+        var desert = Math.exp(-Math.pow((absLat - 23) / 10, 2)) * (0.25 + 0.75 * patch);
+        r = GRASS[0] + (SAND[0] - GRASS[0]) * desert;
+        g = GRASS[1] + (SAND[1] - GRASS[1]) * desert;
+        b = GRASS[2] + (SAND[2] - GRASS[2]) * desert;
+        var cold = Math.min(1, Math.max(0, (absLat - 48) / 20));
+        r += (TUNDRA[0] - r) * cold;
+        g += (TUNDRA[1] - g) * cold;
+        b += (TUNDRA[2] - b) * cold;
+        var shade = 0.75 + 0.5 * elev;
+        r *= shade; g *= shade; b *= shade;
+        a = 0.4 + 0.6 * Math.min(1, Math.max(0, (elev - 0.15) / 0.7));
+      } else {
+        var depth = Math.sqrt(Math.min(1, Math.max(0, (LAND_THRESHOLD - field) / 0.25)));
+        r = SHALLOW[0] + (DEEP[0] - SHALLOW[0]) * depth;
+        g = SHALLOW[1] + (DEEP[1] - SHALLOW[1]) * depth;
+        b = SHALLOW[2] + (DEEP[2] - SHALLOW[2]) * depth;
+        a = 0.06;
+      }
+      var k = (j * W + i) * 4;
+      data[k] = Math.min(255, r * 255);
+      data[k + 1] = Math.min(255, g * 255);
+      data[k + 2] = Math.min(255, b * 255);
+      data[k + 3] = a * 255;
+    }
+  }
+  var tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Moon map: gray FBM mottling + maria blobs + rimmed craters. 512x256.
+function makeMoonTexture() {
+  var W = 512, H = 256;
+  var data = new Uint8Array(W * H * 4);
+  var rng = makeRng(77);
+  var craters = [], maria = [], i;
+  for (i = 0; i < 70; i++) {
+    craters.push({ x: rng() * W, y: (0.08 + 0.84 * rng()) * H, r: 2 + Math.pow(rng(), 2) * 16 });
+  }
+  for (i = 0; i < 5; i++) {
+    maria.push({ x: (0.25 + 0.5 * rng()) * W, y: (0.3 + 0.4 * rng()) * H, r: 18 + rng() * 38 });
+  }
+  function wrapDx(x, cx) {
+    var dx = Math.abs(x - cx);
+    return dx > W / 2 ? W - dx : dx;
+  }
+  for (var j = 0; j < H; j++) {
+    for (i = 0; i < W; i++) {
+      var g = 0.60 + (fbm(i / W, j / H, 4000, 4) - 0.5) * 0.28;
+      var m;
+      for (m = 0; m < maria.length; m++) {
+        var ma = maria[m];
+        var dm = wrapDx(i, ma.x), dym = j - ma.y;
+        g -= 0.17 * Math.exp(-(dm * dm + dym * dym) / (ma.r * ma.r));
+      }
+      for (m = 0; m < craters.length; m++) {
+        var c = craters[m];
+        var dyc = j - c.y;
+        if (dyc > c.r * 1.3 || dyc < -c.r * 1.3) continue;
+        var dxc = wrapDx(i, c.x);
+        if (dxc > c.r * 1.3) continue;
+        var d = Math.sqrt(dxc * dxc + dyc * dyc);
+        if (d < c.r * 0.75) g -= 0.10 * (1 - d / (c.r * 0.75));
+        else if (d < c.r * 1.1) g += 0.07;
+      }
+      g = Math.min(1, Math.max(0.02, g));
+      var k = (j * W + i) * 4;
+      data[k] = g * 255;
+      data[k + 1] = g * 250;
+      data[k + 2] = g * 242;
+      data[k + 3] = 255;
+    }
+  }
+  var tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function makeGlowTexture() {
+  var c = document.createElement('canvas');
+  c.width = c.height = 256;
+  var ctx = c.getContext('2d');
+  var grad = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grad.addColorStop(0, 'rgba(255,240,200,1)');
+  grad.addColorStop(0.18, 'rgba(255,220,150,0.55)');
+  grad.addColorStop(0.5, 'rgba(255,180,90,0.13)');
+  grad.addColorStop(1, 'rgba(255,150,60,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 256, 256);
+  return new THREE.CanvasTexture(c);
+}
+
+function makeLabelTexture(text) {
+  var c = document.createElement('canvas');
+  c.width = c.height = 64;
+  var ctx = c.getContext('2d');
+  ctx.font = 'bold 44px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'rgba(150,210,255,0.95)';
+  ctx.fillText(text, 32, 34);
+  return new THREE.CanvasTexture(c);
+}
+
+/* ============================ EARTH SHADER ==============================
+   Custom Lambert so the terminator emerges from geometry AND the seasonal
+   snow can be blended per-fragment from two snowline uniforms — no texture
+   regeneration while the date animates. */
+
+var EARTH_VERT = [
+  'varying vec2 vUv;',
+  'varying vec3 vN;',
+  'varying vec3 vW;',
+  'void main() {',
+  '  vUv = uv;',
+  '  vN = normalize(mat3(modelMatrix) * normal);', // uniform scale only
+  '  vec4 w = modelMatrix * vec4(position, 1.0);',
+  '  vW = w.xyz;',
+  '  gl_Position = projectionMatrix * viewMatrix * w;',
+  '}'
+].join('\n');
+
+var EARTH_FRAG = [
+  'uniform sampler2D uMap;',
+  'uniform vec3 uSunPos;',
+  'uniform float uSnowN;', // northern snowline latitude, radians
+  'uniform float uSnowS;', // southern snowline latitude (positive), radians
+  'varying vec2 vUv;',
+  'varying vec3 vN;',
+  'varying vec3 vW;',
+  'void main() {',
+  '  vec4 t = texture2D(uMap, vUv);',
+  '  float lat = (vUv.y - 0.5) * 3.14159265;',
+  '  float s = t.a;', // snow susceptibility (low on ocean, elevation-ish on land)
+  '  float snowLat = lat >= 0.0 ? uSnowN : uSnowS;',
+  // Low susceptibility pushes the latitude a pixel needs before it whitens;
+  // the 1.50 rad (86 deg) clamp keeps permanent polar caps year-round.
+  '  float need = min(snowLat + (1.0 - s) * 0.38, 1.50);',
+  '  float snow = smoothstep(need - 0.045, need + 0.045, abs(lat));',
+  '  vec3 albedo = mix(t.rgb, vec3(0.90, 0.93, 0.97), snow);',
+  '  vec3 N = normalize(vN);',
+  '  vec3 S = normalize(uSunPos - vW);',
+  '  float day = clamp(dot(N, S), 0.0, 1.0);',
+  '  vec3 V = normalize(cameraPosition - vW);',
+  '  float ocean = 1.0 - smoothstep(0.05, 0.18, t.a);',
+  '  vec3 H = normalize(S + V);',
+  '  float spec = pow(max(dot(N, H), 0.0), 180.0) * ocean * day * 0.4 * (1.0 - snow);',
+  '  vec3 col = albedo * (day * 1.3 + 0.03) + vec3(1.0, 0.97, 0.88) * spec;',
+  '  float rim = pow(1.0 - max(dot(N, V), 0.0), 2.6);',
+  '  col += vec3(0.25, 0.5, 1.0) * rim * (day * 0.45 + 0.02);',
+  '  col += t.rgb * vec3(0.05, 0.07, 0.13) * (1.0 - day);', // faint night side
+  '  gl_FragColor = vec4(col, 1.0);',
+  '}'
+].join('\n');
+
+/* ============================== SCENE =================================== */
+
+var view = document.getElementById('view');
+var renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+} catch (e) {
+  document.getElementById('err').style.display = 'block';
+  return;
+}
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2)); // mobile fps cap
+renderer.setSize(window.innerWidth, window.innerHeight);
+view.appendChild(renderer.domElement);
+
+var scene = new THREE.Scene();
+var camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.05, 500000);
+
+// --- Sun (the single real light source) ---
+var sunMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 48, 32),
+  new THREE.MeshBasicMaterial({ color: 0xfff0b8 })
+);
+scene.add(sunMesh);
+var glow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeGlowTexture(), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true
+}));
+scene.add(glow);
+var sunLight = new THREE.PointLight(0xffffff, 1.35, 0); // distance 0: no falloff, survives true scale
+scene.add(sunLight);
+scene.add(new THREE.AmbientLight(0x404b60, 0.22)); // faint fill for the Moon's night side
+
+// --- Earth ---
+// earthSystem is TRANSLATED along the orbit, never rotated, so the tilt
+// quaternion below stays fixed in inertial space by construction (this is
+// what keeps the seasons correct).
+var earthSystem = new THREE.Group();
+scene.add(earthSystem);
+var earthTilt = new THREE.Group();
+earthTilt.rotation.z = -TILT; // axis leans toward +X, set once, never touched
+earthSystem.add(earthTilt);
+var qTiltInv = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, -TILT)).invert();
+
+var earthUniforms = {
+  uMap: { value: makeEarthTexture() },
+  uSunPos: { value: new THREE.Vector3(0, 0, 0) },
+  uSnowN: { value: snowlineLat(0.5) },
+  uSnowS: { value: snowlineLat(0.5) }
+};
+var earthMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(EARTH_R, 64, 48),
+  new THREE.ShaderMaterial({ vertexShader: EARTH_VERT, fragmentShader: EARTH_FRAG, uniforms: earthUniforms })
+);
+earthTilt.add(earthMesh);
+
+// Axis line + equator ring + "N" label (teaching aids)
+var axisGeom = new THREE.BufferGeometry().setFromPoints([
+  new THREE.Vector3(0, -1.55, 0), new THREE.Vector3(0, 1.55, 0)
+]);
+earthTilt.add(new THREE.Line(axisGeom, new THREE.LineBasicMaterial({ color: 0x7fc4ff, transparent: true, opacity: 0.75 })));
+var eqPts = [];
+for (var ei = 0; ei <= 96; ei++) {
+  var ea = (ei / 96) * 2 * Math.PI;
+  eqPts.push(new THREE.Vector3(Math.cos(ea) * 1.02, 0, Math.sin(ea) * 1.02));
+}
+earthTilt.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(eqPts),
+  new THREE.LineBasicMaterial({ color: 0xffb066, transparent: true, opacity: 0.35 })));
+var nLabel = new THREE.Sprite(new THREE.SpriteMaterial({ map: makeLabelTexture('N'), transparent: true, depthWrite: false }));
+nLabel.position.set(0, 1.85, 0);
+nLabel.scale.setScalar(0.5);
+earthTilt.add(nLabel);
+
+// --- Moon ---
+// Phong (per-fragment lighting; r128 Lambert is per-vertex and would give a
+// blobby terminator) with zero-ish specular = effectively per-pixel Lambert.
+var moonMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(MOON_R, 48, 32),
+  new THREE.MeshPhongMaterial({ map: makeMoonTexture(), shininess: 4, specular: 0x1a1a1a })
+);
+scene.add(moonMesh);
+
+// --- Orbit path lines (unit circles, scaled per frame) ---
+function makeCircleLine(color, opacity, segments) {
+  var pts = [];
+  for (var i = 0; i <= segments; i++) {
+    var a = (i / segments) * 2 * Math.PI;
+    pts.push(new THREE.Vector3(Math.cos(a), 0, Math.sin(a)));
+  }
+  return new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: opacity }));
+}
+var earthOrbitLine = makeCircleLine(0x4a6a9a, 0.4, 256);
+scene.add(earthOrbitLine);
+var moonOrbitGroup = new THREE.Group();
+moonOrbitGroup.rotation.x = MOON_INCL; // fixed node line along X (no 18.6-yr regression)
+var moonOrbitLine = makeCircleLine(0x8a8a9a, 0.35, 128);
+moonOrbitGroup.add(moonOrbitLine);
+scene.add(moonOrbitGroup);
+
+// --- Starfield: one Points draw, no size attenuation ---
+(function makeStars() {
+  var N = 1500;
+  var pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  var rng = makeRng(12345);
+  for (var i = 0; i < N; i++) {
+    var z = rng() * 2 - 1;
+    var a = rng() * 2 * Math.PI;
+    var r = Math.sqrt(1 - z * z);
+    var R = 200000;
+    pos[i * 3] = r * Math.cos(a) * R;
+    pos[i * 3 + 1] = z * R;
+    pos[i * 3 + 2] = r * Math.sin(a) * R;
+    var b = 0.35 + 0.65 * rng() * rng();
+    var warm = rng();
+    col[i * 3] = b * (0.85 + 0.15 * warm);
+    col[i * 3 + 1] = b * 0.9;
+    col[i * 3 + 2] = b * (1.05 - 0.15 * warm);
+  }
+  var g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 1.6, sizeAttenuation: false, vertexColors: true })));
+})();
+
+/* ======================= SIMULATION STATE / UPDATE ====================== */
+
+var simMs = Date.now();
+var speedIdx = 1;
+var scaleT = 0, scaleGoal = 0;      // 0 = readable, 1 = true scale
+var cur = { D: 0, moonD: 0, sunR: 0 };
+var earthPos = new THREE.Vector3(), moonPos = new THREE.Vector3();
+var tmpV = new THREE.Vector3();
+var Y_AXIS = new THREE.Vector3(0, 1, 0), X_AXIS = new THREE.Vector3(1, 0, 0);
+
+function logMix(a, b, t) { return Math.exp(Math.log(a) + (Math.log(b) - Math.log(a)) * t); }
+
+function applyScale(t) {
+  var e = t * t * (3 - 2 * t); // ease
+  cur.D = logMix(SCALES.readable.earthOrbit, SCALES.true.earthOrbit, e);
+  cur.moonD = logMix(SCALES.readable.moonOrbit, SCALES.true.moonOrbit, e);
+  cur.sunR = logMix(SCALES.readable.sunR, SCALES.true.sunR, e);
+  sunMesh.scale.setScalar(cur.sunR);
+  glow.scale.setScalar(cur.sunR * 7);
+  earthOrbitLine.scale.setScalar(cur.D);
+  moonOrbitLine.scale.setScalar(cur.moonD);
+}
+
+function updateBodies() {
+  var theta = orbitAngle(simMs);
+
+  earthPosition(theta, cur.D, earthPos);
+  earthSystem.position.copy(earthPos);
+
+  // Daily rotation: spin so the subsolar longitude matches UTC
+  // (noon UTC -> longitude 0 faces the Sun; equation of time ignored).
+  var sunward = tmpV.set(Math.sin(theta), 0, Math.cos(theta)); // Earth -> Sun
+  var vLocal = sunward.clone().applyQuaternion(qTiltInv);      // into tilt frame
+  var aSun = Math.atan2(vLocal.z, -vLocal.x);
+  var Lss = (12 - utcHours(simMs)) * 15 * DEG;
+  earthMesh.rotation.y = aSun - Math.PI - Lss;
+
+  // Moon: phase angle from the new-moon epoch, measured CCW (from north) off
+  // the sunward direction; 5.1 deg inclination about a fixed node line (X).
+  var phase = moonPhase(simMs);
+  var mdir = sunward.clone().applyAxisAngle(Y_AXIS, phase * 2 * Math.PI);
+  mdir.applyAxisAngle(X_AXIS, MOON_INCL);
+  moonPos.copy(earthPos).addScaledVector(mdir, cur.moonD);
+  moonMesh.position.copy(moonPos);
+  moonMesh.lookAt(earthPos); // tidally locked
+  moonOrbitGroup.position.copy(earthPos);
+
+  // Seasonal snowlines (hemispheres in opposite phase by construction)
+  var wN = warmthNorth(theta);
+  earthUniforms.uSnowN.value = snowlineLat(wN);
+  earthUniforms.uSnowS.value = snowlineLat(1 - wN);
+}
+
+/* ========================= CAMERA + CONTROLS ============================ */
+
+var cam = {
+  focus: 'free',
+  yaw: 0.9, pitch: 0.38,
+  radius: SCALES.readable.earthOrbit * 2.3,
+  radiusGoal: SCALES.readable.earthOrbit * 2.3,
+  target: new THREE.Vector3(),
+  freeTarget: new THREE.Vector3()
+};
+
+function focusPoint(out) {
+  if (cam.focus === 'sun') return out.set(0, 0, 0);
+  if (cam.focus === 'earth') return out.copy(earthPos);
+  if (cam.focus === 'moon') return out.copy(moonPos);
+  return out.copy(cam.freeTarget);
+}
+function minRadius() {
+  if (cam.focus === 'sun') return cur.sunR * 1.6;
+  if (cam.focus === 'earth') return EARTH_R * 1.5;
+  if (cam.focus === 'moon') return MOON_R * 1.7;
+  return EARTH_R * 1.5;
+}
+function maxRadius() { return cur.D * 8; }
+function clampRadius() {
+  cam.radiusGoal = Math.min(maxRadius(), Math.max(minRadius(), cam.radiusGoal));
+}
+function defaultRadius(focus) {
+  if (focus === 'sun') return cur.sunR * 5;
+  if (focus === 'earth') return 5.5;
+  if (focus === 'moon') return 2.2;
+  return cur.D * 2.3;
+}
+
+var goal = new THREE.Vector3();
+function updateCamera(dt) {
+  focusPoint(goal);
+  var k = 1 - Math.exp(-dt * 8);
+  cam.target.lerp(goal, k);
+  cam.radius += (cam.radiusGoal - cam.radius) * k;
+  var cp = Math.cos(cam.pitch);
+  camera.position.set(
+    cam.target.x + cam.radius * cp * Math.sin(cam.yaw),
+    cam.target.y + cam.radius * Math.sin(cam.pitch),
+    cam.target.z + cam.radius * cp * Math.cos(cam.yaw)
+  );
+  camera.lookAt(cam.target);
+  var near = Math.min(200, Math.max(0.02, cam.radius * 0.004));
+  if (Math.abs(near - camera.near) / camera.near > 0.25) {
+    camera.near = near;
+    camera.updateProjectionMatrix();
+  }
+}
+
+// Custom controls (no OrbitControls): Pointer Events unify mouse + touch.
+// One pointer drags the orbit, two pinch-zoom, wheel zooms.
+var pointers = new Map();
+var pinchDist = 0;
+var dom = renderer.domElement;
+
+dom.addEventListener('pointerdown', function (e) {
+  dom.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 2) {
+    var p = Array.from(pointers.values());
+    pinchDist = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+  }
+});
+dom.addEventListener('pointermove', function (e) {
+  if (!pointers.has(e.pointerId)) return;
+  var prev = pointers.get(e.pointerId);
+  var dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+  prev.x = e.clientX; prev.y = e.clientY;
+  if (pointers.size === 1) {
+    cam.yaw -= dx * 0.005;
+    cam.pitch = Math.min(1.48, Math.max(-1.48, cam.pitch - dy * 0.005));
+  } else if (pointers.size === 2) {
+    var p = Array.from(pointers.values());
+    var d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+    if (pinchDist > 0 && d > 0) {
+      cam.radiusGoal *= pinchDist / d;
+      clampRadius();
+    }
+    pinchDist = d;
+  }
+});
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+  pinchDist = 0;
+}
+dom.addEventListener('pointerup', endPointer);
+dom.addEventListener('pointercancel', endPointer);
+dom.addEventListener('wheel', function (e) {
+  e.preventDefault();
+  var d = e.deltaY * (e.deltaMode === 1 ? 33 : 1);
+  cam.radiusGoal *= Math.exp(d * 0.0012);
+  clampRadius();
+}, { passive: false });
+
+/* ================================ UI ==================================== */
+
+var els = {
+  date: document.getElementById('dateInput'),
+  now: document.getElementById('btnNow'),
+  speed: document.getElementById('speed'),
+  speedLabel: document.getElementById('speedLabel'),
+  scaleBtn: document.getElementById('btnScale'),
+  scaleCaption: document.getElementById('scaleCaption'),
+  roDate: document.getElementById('roDate'),
+  roSeason: document.getElementById('roSeason'),
+  roPhase: document.getElementById('roPhase'),
+  focusRow: document.getElementById('focusRow')
+};
+
+els.date.addEventListener('change', function () {
+  var t = Date.parse(els.date.value + ':00Z'); // interpret the field as UTC
+  if (!isNaN(t)) simMs = t;
+});
+els.now.addEventListener('click', function () {
+  simMs = Date.now();
+  syncDateInput(true);
+});
+els.speed.addEventListener('input', function () {
+  speedIdx = +els.speed.value;
+  els.speedLabel.textContent = SPEED_LABELS[speedIdx];
+});
+els.scaleBtn.addEventListener('click', function () {
+  scaleGoal = scaleGoal === 1 ? 0 : 1;
+  els.scaleBtn.textContent = 'True scale: ' + (scaleGoal === 1 ? 'ON' : 'OFF');
+});
+els.focusRow.addEventListener('click', function (e) {
+  var b = e.target.closest('button');
+  if (!b) return;
+  setFocus(b.dataset.focus);
+});
+function setFocus(f) {
+  if (f === 'free') cam.freeTarget.copy(cam.target); // detach where we are
+  cam.focus = f;
+  cam.radiusGoal = defaultRadius(f);
+  clampRadius();
+  var btns = els.focusRow.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i].dataset.focus === f);
+}
+
+function syncDateInput(force) {
+  if (!force && document.activeElement === els.date) return;
+  els.date.value = new Date(simMs).toISOString().slice(0, 16);
+}
+
+function updateReadout() {
+  var theta = orbitAngle(simMs);
+  var si = seasonIndex(theta);
+  var p = moonPhase(simMs);
+  var illum = Math.round((0.5 - 0.5 * Math.cos(p * 2 * Math.PI)) * 100);
+  els.roDate.textContent = fmtUTC(simMs);
+  els.roSeason.textContent = 'N: ' + SEASONS_N[si] + ' · S: ' + SEASONS_S[si];
+  els.roPhase.textContent = phaseName(p) + ' (' + illum + '% lit)';
+}
+
+function updateScaleCaption() {
+  var fS = SCALES.true.sunR / cur.sunR;
+  var fD = SCALES.true.earthOrbit / cur.D;
+  var fM = SCALES.true.moonOrbit / cur.moonD;
+  if (fD < 1.05) {
+    els.scaleCaption.textContent = 'True proportions — at this scale Earth is a speck; focus Earth or Moon to find it.';
+  } else {
+    els.scaleCaption.textContent = 'Compressed: Sun ' + fS.toFixed(0) + '× smaller, Earth orbit ' +
+      fD.toFixed(0) + '× nearer, Moon orbit ' + fM.toFixed(1) + '× nearer.';
+  }
+}
+
+window.addEventListener('resize', function () {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ============================== MAIN LOOP =============================== */
+
+applyScale(0);
+setFocus('free');
+cam.target.set(0, 0, 0);
+cam.freeTarget.set(0, 0, 0);
+cam.radius = cam.radiusGoal;
+updateBodies();
+syncDateInput(true);
+updateReadout();
+updateScaleCaption();
+els.speedLabel.textContent = SPEED_LABELS[speedIdx];
+
+var last = performance.now();
+var uiClock = 0;
+function tick(now) {
+  var dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+
+  simMs += dt * 1000 * SPEED_STOPS[speedIdx];
+
+  // Animate scale toggle; keep the camera framing sensible while distances
+  // stretch by rescaling the orbit radius with the focus context.
+  if (scaleT !== scaleGoal) {
+    var prevSunR = cur.sunR, prevD = cur.D;
+    scaleT += Math.min(Math.abs(scaleGoal - scaleT), dt / 2.0) * Math.sign(scaleGoal - scaleT);
+    applyScale(scaleT);
+    if (cam.focus === 'sun') { cam.radiusGoal *= cur.sunR / prevSunR; cam.radius *= cur.sunR / prevSunR; }
+    if (cam.focus === 'free') { cam.radiusGoal *= cur.D / prevD; cam.radius *= cur.D / prevD; }
+    clampRadius();
+    updateScaleCaption();
+  }
+
+  updateBodies();
+  updateCamera(dt);
+
+  uiClock += dt;
+  if (uiClock > 0.25) {
+    uiClock = 0;
+    updateReadout();
+    if (SPEED_STOPS[speedIdx] !== 0) syncDateInput(false);
+  }
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// Small hook for automated verification / debugging.
+window.orrery = {
+  setDate: function (iso) { simMs = Date.parse(iso); updateBodies(); updateReadout(); syncDateInput(true); },
+  getState: function () {
+    return {
+      simMs: simMs,
+      theta: orbitAngle(simMs),
+      phase: moonPhase(simMs),
+      snowN: earthUniforms.uSnowN.value / DEG,
+      snowS: earthUniforms.uSnowS.value / DEG,
+      earthPos: earthPos.toArray(),
+      moonPos: moonPos.toArray(),
+      spin: earthMesh.rotation.y
+    };
+  },
+  setSpeed: function (i) { speedIdx = i; els.speed.value = i; els.speedLabel.textContent = SPEED_LABELS[i]; },
+  setFocus: setFocus,
+  setScale: function (g) {
+    scaleGoal = g;
+    els.scaleBtn.textContent = 'True scale: ' + (g === 1 ? 'ON' : 'OFF');
+  },
+  cam: cam
+};
+
+})();
+</script>
+</body>
+</html>
